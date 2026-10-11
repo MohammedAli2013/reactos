@@ -304,6 +304,14 @@ static HRESULT DoFormatDriveAsync(HWND hwnd, UINT nDrive)
     return succ ? S_OK : E_FAIL;
 }
 
+enum { CMDID_FORMAT, CMDID_EJECT, CMDID_DISCONNECT };
+static const CMVERBMAP g_VerbMap[] =
+{
+    { "format", CMDID_FORMAT },
+    { "eject", CMDID_EJECT },
+    { "disconnect", CMDID_DISCONNECT },
+};
+
 HRESULT CALLBACK DrivesContextMenuCallback(IShellFolder *psf,
                                            HWND         hwnd,
                                            IDataObject  *pdtobj,
@@ -311,7 +319,7 @@ HRESULT CALLBACK DrivesContextMenuCallback(IShellFolder *psf,
                                            WPARAM       wParam,
                                            LPARAM       lParam)
 {
-    if (uMsg != DFM_MERGECONTEXTMENU && uMsg != DFM_INVOKECOMMAND)
+    if (uMsg != DFM_MERGECONTEXTMENU && uMsg != DFM_INVOKECOMMAND && uMsg != DFM_MAPCOMMANDNAME)
         return SHELL32_DefaultContextMenuCallBack(psf, pdtobj, uMsg);
 
     PIDLIST_ABSOLUTE pidlFolder;
@@ -338,19 +346,6 @@ HRESULT CALLBACK DrivesContextMenuCallback(IShellFolder *psf,
         else
             dwFlags = 0; // Assume drive with unknown filesystem, allow format
     }
-
-// custom command IDs
-#if 0 // Disabled until our menu building system is fixed
-#define CMDID_FORMAT        0
-#define CMDID_EJECT         1
-#define CMDID_DISCONNECT    2
-#else
-/* FIXME: These IDs should start from 0, however there is difference
- * between ours and Windows' menu building systems, which should be fixed. */
-#define CMDID_FORMAT        1
-#define CMDID_EJECT         2
-#define CMDID_DISCONNECT    3
-#endif
 
     if (uMsg == DFM_MERGECONTEXTMENU)
     {
@@ -381,11 +376,10 @@ HRESULT CALLBACK DrivesContextMenuCallback(IShellFolder *psf,
         }
 
         if (idCmd)
-#if 0 // see FIXME above
-            pqcminfo->idCmdFirst = ++idCmd;
-#else
-            pqcminfo->idCmdFirst = (idCmd + 2);
-#endif
+            pqcminfo->idCmdFirst = (idCmd + 2); // Note: This assumes the items above are added in ascending id order.
+                                                // CORE-18577: We add 2 instead of 1 because the other is for our separator!
+                                                // Our CDefaultContextMenu::QueryContextMenu incorrectly assumes
+                                                // all DFM_MERGECONTEXTMENU added items have IDs.
         hr = S_OK;
     }
     else if (uMsg == DFM_INVOKECOMMAND)
@@ -437,6 +431,10 @@ HRESULT CALLBACK DrivesContextMenuCallback(IShellFolder *psf,
                     nStringID = IDS_CANTDISCONNECT;
                 }
             }
+            else if (hr == S_OK)
+            {
+                hr = E_INVALIDARG; // Don't eat DFM_CMD_* in CDefaultContextMenu::Do*
+            }
         }
 
         if (nStringID != 0)
@@ -446,6 +444,16 @@ HRESULT CALLBACK DrivesContextMenuCallback(IShellFolder *psf,
             LoadStringW(shell32_hInstance, nStringID, szFormat, _countof(szFormat));
             wsprintfW(szMessage, szFormat, dwError);
             MessageBoxW(hwnd, szMessage, NULL, MB_ICONERROR);
+        }
+    }
+    else if (uMsg == DFM_MAPCOMMANDNAME)
+    {
+        CMINVOKECOMMANDINFOEX ici = { sizeof(ici), CMIC_MASK_UNICODE };
+        ici.lpVerbW = (PWSTR)lParam;
+        if (SUCCEEDED(hr = SHELL_MapContextMenuVerbToCmdId((CMINVOKECOMMANDINFO*)&ici, g_VerbMap)))
+        {
+            *(int*)wParam = hr;
+            hr = S_OK;
         }
     }
 
@@ -735,6 +743,9 @@ HRESULT WINAPI CDrivesFolder::ParseDisplayName(HWND hwndOwner, LPBC pbc, LPOLEST
          (L'a' <= lpszDisplayName[0] && lpszDisplayName[0] <= L'z')) &&
         lpszDisplayName[1] == L':' && (lpszDisplayName[2] == L'\\' || !lpszDisplayName[2]))
     {
+        if (!lpszDisplayName[2] && LOBYTE(GetVersion()) < 6)
+            return E_INVALIDARG; // NT5 does not support parsing "c:"
+
         // "C:\..."
         WCHAR szRoot[8];
         PathBuildRootW(szRoot, ((*lpszDisplayName - 1) & 0x1F));
@@ -1205,25 +1216,22 @@ HRESULT CDrivesFolder::SetDriveLabel(HWND hwndOwner, PCWSTR DrivePath, PCWSTR La
 
 HRESULT WINAPI CDrivesFolder::GetDefaultSearchGUID(GUID * pguid)
 {
-    FIXME("(%p)\n", this);
-    return E_NOTIMPL;
+    if (LOBYTE(GetVersion()) >= 6)
+        return E_NOTIMPL;
+    *pguid = CLSID_ShellSearchExt;
+    return S_OK;
 }
 
 HRESULT WINAPI CDrivesFolder::EnumSearches(IEnumExtraSearch ** ppenum)
 {
-    FIXME("(%p)\n", this);
+    *ppenum = NULL;
     return E_NOTIMPL;
 }
 
 HRESULT WINAPI CDrivesFolder::GetDefaultColumn (DWORD dwRes, ULONG *pSort, ULONG *pDisplay)
 {
     TRACE("(%p)\n", this);
-
-    if (pSort)
-        *pSort = 0;
-    if (pDisplay)
-        *pDisplay = 0;
-    return S_OK;
+    return E_NOTIMPL; // Not required when column 0 is our default.
 }
 
 HRESULT WINAPI CDrivesFolder::GetDefaultColumnState(UINT iColumn, SHCOLSTATEF * pcsFlags)
