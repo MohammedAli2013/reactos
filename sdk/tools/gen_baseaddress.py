@@ -243,7 +243,7 @@ def size_of_image(filename):
             return 0
         fin.seek(e_lfanew + 0x18)
         pe_magic = struct.unpack('h', fin.read(2))[0]
-        if pe_magic in IMAGE_TYPES.keys():
+        if pe_magic in IMAGE_TYPES:
             IMAGE_TYPES[pe_magic] += 1
             fin.seek(e_lfanew + 0x50)
             pe_size_of_image = struct.unpack('i', fin.read(4))[0]
