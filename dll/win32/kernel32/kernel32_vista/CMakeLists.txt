@@ -21,6 +21,7 @@ list(APPEND SOURCE
     LCIDToLocaleName.c
     LocaleNameToLCID.c
     procattr.c
+    SetFileInformationByHandle.c
     sync.c
     ThreadDescription.c
     threadpool.c

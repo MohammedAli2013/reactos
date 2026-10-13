@@ -9,6 +9,7 @@
 @ stdcall DeleteProcThreadAttributeList(ptr)
 
 @ stdcall GetFileInformationByHandleEx(long long ptr long)
+@ stdcall SetFileInformationByHandle(long long ptr long)
 @ stdcall -ret64 GetTickCount64()
 
 @ stdcall InitializeSRWLock(ptr)
