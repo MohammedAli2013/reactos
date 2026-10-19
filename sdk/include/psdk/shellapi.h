@@ -155,6 +155,7 @@ extern "C" {
 #define FOF_WANTNUKEWARNING        0x4000  /* during delete operation, warn if delete instead
                                               of recycling (even if FOF_NOCONFIRMATION) */
 #define FOF_NORECURSEREPARSE       0x8000  /* don't do recursion into reparse points */
+#define FOF_NO_UI                  (FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR)
 
 #define PO_DELETE 19
 #define PO_RENAME 20
@@ -414,11 +415,6 @@ typedef struct _SHNAMEMAPPINGW {
  * Links
  */
 
-#define SHGNLI_PIDL        0x01
-#define SHGNLI_PREFIXNAME  0x02
-#define SHGNLI_NOUNIQUE    0x04
-#define SHGNLI_NOLNK       0x08
-
 LPWSTR * WINAPI CommandLineToArgvW(_In_ LPCWSTR, _Out_ int*);
 void WINAPI DragAcceptFiles(_In_ HWND, _In_ BOOL);
 void WINAPI DragFinish(_In_ HDROP);
@@ -601,6 +597,13 @@ SHGetFileInfoW(
   _Inout_updates_bytes_opt_(cbFileInfo) SHFILEINFOW *psfi,
   UINT cbFileInfo,
   UINT uFlags);
+
+#define SHGNLI_PIDL        0x01
+#define SHGNLI_PREFIXNAME  0x02
+#define SHGNLI_NOUNIQUE    0x04
+#define SHGNLI_NOLNK       0x08
+#define SHGNLI_NOLOCNAME   0x10 // WinVista+
+#define SHGNLI_USEURLEXT   0x20 // Win7+
 
 _Success_(return != 0)
 BOOL

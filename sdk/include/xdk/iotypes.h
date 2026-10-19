@@ -1021,7 +1021,7 @@ typedef struct _TARGET_DEVICE_REMOVAL_NOTIFICATION {
   struct _FILE_OBJECT *FileObject;
 } TARGET_DEVICE_REMOVAL_NOTIFICATION, *PTARGET_DEVICE_REMOVAL_NOTIFICATION;
 
-#if (NTDDI_VERSION >= NTDDI_VISTA)
+#if (NTDDI_VERSION >= NTDDI_VISTA) || defined(__REACTOS__)
 #include <devpropdef.h>
 #define PLUGPLAY_PROPERTY_PERSISTENT   0x00000001
 #endif
@@ -2169,6 +2169,19 @@ typedef struct _DEVOBJ_EXTENSION {
   CSHORT Type;
   USHORT Size;
   PDEVICE_OBJECT DeviceObject;
+  ULONG PowerFlags;                             
+  struct _DEVICE_OBJECT_POWER_EXTENSION  *Dope;  
+  ULONG ExtensionFlags;                                   
+  PVOID DeviceNode;                             
+  PDEVICE_OBJECT AttachedTo;                             
+  __volatile LONG StartIoCount;                           
+  LONG StartIoKey;                              
+  ULONG StartIoFlags;                            
+  PVPB Vpb;                                     
+  PVOID DependencyNode;
+  PVOID InterruptContext;
+  __volatile LONG InterruptCount;
+  __volatile PVOID VerifierContext;
 } DEVOBJ_EXTENSION, *PDEVOBJ_EXTENSION;
 
 typedef struct _SCATTER_GATHER_ELEMENT {

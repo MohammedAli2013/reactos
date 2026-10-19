@@ -34,6 +34,10 @@
 #define NDEBUG
 #include <debug.h>
 
+/* Set to 1 to dump each data run list as it is encoded. Uses DbgPrint, so it
+ * prints whatever NDEBUG is set to. */
+#define NTFS_DUMP_DATA_RUNS 0
+
 /* FUNCTIONS ****************************************************************/
 
 /**
@@ -268,22 +272,13 @@ AddFileName(PFILE_RECORD_HEADER FileRecord,
         FileNameAttribute->FileAttributes = NTFS_FILE_TYPE_ARCHIVE;
 
     // we need to extract the filename from the path
-    DPRINT1("Pathname: %wZ\n", &FileObject->FileName);
+    DPRINT("Pathname: %wZ\n", &FileObject->FileName);
 
     FsRtlDissectName(FileObject->FileName, &Current, &Remaining);
 
-    FilenameNoPath.Buffer = Current.Buffer;
-    FilenameNoPath.MaximumLength = FilenameNoPath.Length = Current.Length;
-
-    while (Current.Length != 0)
+    while (Remaining.Length != 0)
     {
-        DPRINT1("Current: %wZ\n", &Current);
-
-        if (Remaining.Length != 0)
-        {
-            FilenameNoPath.Buffer = Remaining.Buffer;
-            FilenameNoPath.Length = FilenameNoPath.MaximumLength = Remaining.Length;
-        }
+        DPRINT("Current: %wZ\n", &Current);
 
         FirstEntry = 0;
         Status = NtfsFindMftRecord(DeviceExt,
@@ -294,28 +289,25 @@ AddFileName(PFILE_RECORD_HEADER FileRecord,
                                    CaseSensitive,
                                    &CurrentMFTIndex);
         if (!NT_SUCCESS(Status))
-            break;
-
-        if (Remaining.Length == 0 )
         {
-            if (Current.Length != 0)
-            {
-                FilenameNoPath.Buffer = Current.Buffer;
-                FilenameNoPath.Length = FilenameNoPath.MaximumLength = Current.Length;
-            }
-            break;
+            DPRINT1("Path component '%wZ' of '%wZ' not found (Status %lx)\n",
+                    &Current, &FileObject->FileName, Status);
+            return Status;
         }
 
         FsRtlDissectName(Remaining, &Current, &Remaining);
     }
 
-    DPRINT1("MFT Index of parent: %I64u\n", CurrentMFTIndex);
+    /* Whatever is left over is the file's own name */
+    FilenameNoPath = Current;
+
+    DPRINT("MFT Index of parent: %I64u\n", CurrentMFTIndex);
 
     // set reference to parent directory
     FileNameAttribute->DirectoryFileReferenceNumber = CurrentMFTIndex;
     *ParentMftIndex = CurrentMFTIndex;
 
-    DPRINT1("SequenceNumber: 0x%02x\n", FileRecord->SequenceNumber);
+    DPRINT("SequenceNumber: 0x%02x\n", FileRecord->SequenceNumber);
 
     // The highest 2 bytes should be the sequence number, unless the parent happens to be root
     if (CurrentMFTIndex == NTFS_FILE_ROOT)
@@ -323,7 +315,7 @@ AddFileName(PFILE_RECORD_HEADER FileRecord,
     else
         FileNameAttribute->DirectoryFileReferenceNumber |= (ULONGLONG)FileRecord->SequenceNumber << 48;
 
-    DPRINT1("FileNameAttribute->DirectoryFileReferenceNumber: 0x%016I64x\n", FileNameAttribute->DirectoryFileReferenceNumber);
+    DPRINT("FileNameAttribute->DirectoryFileReferenceNumber: 0x%016I64x\n", FileNameAttribute->DirectoryFileReferenceNumber);
 
     FileNameAttribute->NameLength = FilenameNoPath.Length / sizeof(WCHAR);
     RtlCopyMemory(FileNameAttribute->Name, FilenameNoPath.Buffer, FilenameNoPath.Length);
@@ -587,8 +579,8 @@ AddIndexRoot(PNTFS_VCB Vcb,
 * STATUS_INSUFFICIENT_RESOURCES if ConvertDataRunsToLargeMCB() fails or if we fail to allocate a
 * buffer for the new data runs.
 * STATUS_INSUFFICIENT_RESOURCES or STATUS_UNSUCCESSFUL if FsRtlAddLargeMcbEntry() fails.
-* STATUS_BUFFER_TOO_SMALL if ConvertLargeMCBToDataRuns() fails.
 * STATUS_NOT_IMPLEMENTED if we need to migrate the attribute to an attribute list (TODO).
+* Any other failure from ConvertLargeMCBToDataRuns() is returned as-is.
 *
 * @remarks
 * Clusters should have been allocated previously with NtfsAllocateClusters().
@@ -608,6 +600,7 @@ AddRun(PNTFS_VCB Vcb,
     PNTFS_ATTR_RECORD DestinationAttribute = (PNTFS_ATTR_RECORD)((ULONG_PTR)FileRecord + AttrOffset);
     ULONG NextAttributeOffset = AttrOffset + AttrContext->pRecord->Length;
     ULONGLONG NextVBN = 0;
+    ULONGLONG HighestVcn;
 
     PUCHAR RunBuffer;
     ULONG RunBufferSize;
@@ -617,6 +610,9 @@ AddRun(PNTFS_VCB Vcb,
 
     if (AttrContext->pRecord->NonResident.AllocatedSize != 0)
         NextVBN = AttrContext->pRecord->NonResident.HighestVCN + 1;
+
+    /* The run goes on the end, so it holds the new last VCN */
+    HighestVcn = NextVBN + RunLength - 1;
 
     // Add newly-assigned clusters to mcb
     _SEH2_TRY
@@ -643,8 +639,21 @@ AddRun(PNTFS_VCB Vcb,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Convert the map control block back to encoded data runs
-    ConvertLargeMCBToDataRuns(&AttrContext->DataRunsMCB, RunBuffer, Vcb->NtfsInfo.BytesPerCluster, &RunBufferSize);
+    // Convert the map control block back to encoded data runs.
+    Status = ConvertLargeMCBToDataRuns(&AttrContext->DataRunsMCB, HighestVcn + 1, RunBuffer, Vcb->NtfsInfo.BytesPerFileRecord, &RunBufferSize);
+    if (Status == STATUS_BUFFER_TOO_SMALL)
+    {
+        // Runs won't fit in a single record; migrating to an $ATTRIBUTE_LIST isn't supported yet.
+        DPRINT1("Data runs too large for one file record - $ATTRIBUTE_LIST needed (not implemented)\n");
+        ExFreePoolWithTag(RunBuffer, TAG_NTFS);
+        return STATUS_NOT_IMPLEMENTED;
+    }
+    else if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("ERROR: Failed to convert data runs! (Status %lx)\n", Status);
+        ExFreePoolWithTag(RunBuffer, TAG_NTFS);
+        return Status;
+    }
 
     // Get the amount of free space between the start of the of the first data run and the attribute end
     DataRunMaxLength = AttrContext->pRecord->Length - AttrContext->pRecord->NonResident.MappingPairsOffset;
@@ -675,7 +684,7 @@ AddRun(PNTFS_VCB Vcb,
             ULONG_PTR MoveTo = (ULONG_PTR)DestinationAttribute + AttrContext->pRecord->NonResident.MappingPairsOffset + RunBufferSize;
             MoveTo = ALIGN_UP_BY(MoveTo, ATTR_RECORD_ALIGNMENT);
 
-            DPRINT1("Moving attribute(s) after this one starting with type 0x%lx\n", NextAttribute->Type);
+            DPRINT("Moving attribute(s) after this one starting with type 0x%lx\n", NextAttribute->Type);
 
             // Move the trailing attributes; FinalAttribute will point to the end marker
             FinalAttribute = MoveAttributes(Vcb, NextAttribute, NextAttributeOffset, MoveTo);
@@ -713,8 +722,14 @@ AddRun(PNTFS_VCB Vcb,
 
     // Update HighestVCN
     DestinationAttribute->NonResident.HighestVCN =
-    AttrContext->pRecord->NonResident.HighestVCN = max(NextVBN - 1 + RunLength,
-                                                     AttrContext->pRecord->NonResident.HighestVCN);
+    AttrContext->pRecord->NonResident.HighestVCN = HighestVcn;
+
+    /* Sparse and compressed streams also count the clusters they really own */
+    if (AttrContext->pRecord->Flags & (NTFS_ATTR_COMPRESSION_MASK | NTFS_ATTR_SPARSE))
+    {
+        AttrContext->pRecord->NonResident.CompressedSize += (ULONGLONG)RunLength * Vcb->NtfsInfo.BytesPerCluster;
+        DestinationAttribute->NonResident.CompressedSize = AttrContext->pRecord->NonResident.CompressedSize;
+    }
 
     // Write data runs to destination attribute
     RtlCopyMemory((PVOID)((ULONG_PTR)DestinationAttribute + DestinationAttribute->NonResident.MappingPairsOffset),
@@ -731,7 +746,9 @@ AddRun(PNTFS_VCB Vcb,
 
     ExFreePoolWithTag(RunBuffer, TAG_NTFS);
 
+#if NTFS_DUMP_DATA_RUNS
     NtfsDumpDataRuns((PUCHAR)((ULONG_PTR)DestinationAttribute + DestinationAttribute->NonResident.MappingPairsOffset), 0);
+#endif
 
     return Status;
 }
@@ -878,6 +895,10 @@ ConvertDataRunsToLargeMCB(PUCHAR DataRun,
 * @param DataRunsMCB
 * Pointer to a LARGE_MCB structure describing the data runs.
 *
+* @param VcnCount
+* Number of VCNs the runs must describe, HighestVCN + 1. A hole the MCB doesn't
+* reach, at the end of a sparse stream, is encoded up to this point.
+*
 * @param RunBuffer
 * Pointer to the buffer that will receive the encoded data runs.
 *
@@ -894,43 +915,61 @@ ConvertDataRunsToLargeMCB(PUCHAR DataRun,
 */
 NTSTATUS
 ConvertLargeMCBToDataRuns(PLARGE_MCB DataRunsMCB,
+                          ULONGLONG VcnCount,
                           PUCHAR RunBuffer,
                           ULONG MaxBufferSize,
                           PULONG UsedBufferSize)
 {
     NTSTATUS Status = STATUS_SUCCESS;
     ULONG RunBufferOffset = 0;
-    LONGLONG  DataRunOffset;
+    LONGLONG  DataRunOffset = 0;
     ULONGLONG LastLCN = 0;
+    ULONGLONG NextVcn = 0;
     LONGLONG Vbn, Lbn, Count;
     ULONG i;
+    BOOLEAN Tail = FALSE;
 
 
     DPRINT("\t[Vbn, Lbn, Count]\n");
 
-    // convert each mcb entry to a data run
-    for (i = 0; FsRtlGetNextLargeMcbEntry(DataRunsMCB, i, &Vbn, &Lbn, &Count); i++)
+    // convert each mcb entry to a data run, then the trailing hole if there is one
+    for (i = 0; ; i++)
     {
         UCHAR DataRunOffsetSize = 0;
         UCHAR DataRunLengthSize = 0;
         UCHAR ControlByte = 0;
 
+        if (!FsRtlGetNextLargeMcbEntry(DataRunsMCB, i, &Vbn, &Lbn, &Count))
+        {
+            if (NextVcn >= VcnCount)
+                break;
+
+            /* The MCB only knows mapped clusters, so a hole at the end isn't in it */
+            Vbn = NextVcn;
+            Lbn = -1;
+            Count = VcnCount - NextVcn;
+            Tail = TRUE;
+        }
+
         // [vbn, lbn, count]
         DPRINT("\t[%I64d, %I64d,%I64d]\n", Vbn, Lbn, Count);
-
-        // TODO: check for holes and convert to sparse runs
-        DataRunOffset = Lbn - LastLCN;
-        LastLCN = Lbn;
-
-        // now we need to determine how to represent DataRunOffset with the minimum number of bytes
-        DPRINT("Determining how many bytes needed to represent %I64x\n", DataRunOffset);
-        DataRunOffsetSize = GetPackedByteCount(DataRunOffset, TRUE);
-        DPRINT("%d bytes needed.\n", DataRunOffsetSize);
 
         // determine how to represent DataRunLengthSize with the minimum number of bytes
         DPRINT("Determining how many bytes needed to represent %I64x\n", Count);
         DataRunLengthSize = GetPackedByteCount(Count, TRUE);
         DPRINT("%d bytes needed.\n", DataRunLengthSize);
+
+        /* A sparse run has no offset, and the next real run is relative to the last real one */
+        if (Lbn != -1)
+        {
+            DataRunOffset = Lbn - LastLCN;
+            LastLCN = Lbn;
+
+            // now we need to determine how to represent DataRunOffset with the minimum number of bytes
+            DPRINT("Determining how many bytes needed to represent %I64x\n", DataRunOffset);
+            DataRunOffsetSize = GetPackedByteCount(DataRunOffset, TRUE);
+            DPRINT("%d bytes needed.\n", DataRunOffsetSize);
+        }
 
         // ensure the next data run + end marker would be <= Max buffer size
         if (RunBufferOffset + 2 + DataRunLengthSize + DataRunOffsetSize > MaxBufferSize)
@@ -951,6 +990,11 @@ ConvertLargeMCBToDataRuns(PLARGE_MCB DataRunsMCB,
         // copy DataRunOffset
         RtlCopyMemory(RunBuffer + RunBufferOffset, &DataRunOffset, DataRunOffsetSize);
         RunBufferOffset += DataRunOffsetSize;
+
+        NextVcn = Vbn + Count;
+
+        if (Tail)
+            break;
     }
 
     // End of data runs
@@ -1070,64 +1114,27 @@ FreeClusters(PNTFS_VCB Vcb,
     PUCHAR RunBuffer;
     ULONG RunBufferSize = 0;
 
-    PFILE_RECORD_HEADER BitmapRecord;
-    PNTFS_ATTR_CONTEXT DataContext;
-    ULONGLONG BitmapDataSize;
-    PUCHAR BitmapData;
-    RTL_BITMAP Bitmap;
-    ULONG LengthWritten;
+    ULONG LowestFreed = MAXULONG;
+    ULONG HighestFreed = 0;
+    ULONG Freed = 0;
 
     if (!AttrContext->pRecord->IsNonResident)
     {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // Read the $Bitmap file
-    BitmapRecord = ExAllocateFromNPagedLookasideList(&Vcb->FileRecLookasideList);
-    if (BitmapRecord == NULL)
-    {
-        DPRINT1("Error: Unable to allocate memory for bitmap file record!\n");
-        return STATUS_NO_MEMORY;
-    }
-
-    Status = ReadFileRecord(Vcb, NTFS_FILE_BITMAP, BitmapRecord);
-    if (!NT_SUCCESS(Status))
-    {
-        DPRINT1("Error: Unable to read file record for bitmap!\n");
-        ExFreeToNPagedLookasideList(&Vcb->FileRecLookasideList, BitmapRecord);
-        return 0;
-    }
-
-    Status = FindAttribute(Vcb, BitmapRecord, AttributeData, L"", 0, &DataContext, NULL);
-    if (!NT_SUCCESS(Status))
-    {
-        DPRINT1("Error: Unable to find data attribute for bitmap file!\n");
-        ExFreeToNPagedLookasideList(&Vcb->FileRecLookasideList, BitmapRecord);
-        return 0;
-    }
-
-    BitmapDataSize = AttributeDataLength(DataContext->pRecord);
-    BitmapDataSize = min(BitmapDataSize, ULONG_MAX);
-    ASSERT((BitmapDataSize * 8) >= Vcb->NtfsInfo.ClusterCount);
-    BitmapData = ExAllocatePoolWithTag(NonPagedPool, ROUND_UP(BitmapDataSize, Vcb->NtfsInfo.BytesPerSector), TAG_NTFS);
-    if (BitmapData == NULL)
-    {
-        DPRINT1("Error: Unable to allocate memory for bitmap file data!\n");
-        ReleaseAttributeContext(DataContext);
-        ExFreeToNPagedLookasideList(&Vcb->FileRecLookasideList, BitmapRecord);
-        return 0;
-    }
-
-    ReadAttribute(Vcb, DataContext, 0, (PCHAR)BitmapData, (ULONG)BitmapDataSize);
-
-    RtlInitializeBitMap(&Bitmap, (PULONG)BitmapData, Vcb->NtfsInfo.ClusterCount);
+    /* Same lock NtfsAllocateClusters() holds over the bitmap copy */
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&Vcb->BitmapResource, TRUE);
 
     // free clusters in $BITMAP file
     while (ClustersLeftToFree > 0)
     {
-        LONGLONG LargeVbn, LargeLbn;
+        ULONGLONG LastVcn = AttrContext->pRecord->NonResident.HighestVCN;
+        LONGLONG LargeLbn;
 
-        if (!FsRtlLookupLastLargeMcbEntry(&AttrContext->DataRunsMCB, &LargeVbn, &LargeLbn))
+        /* An empty stream has HighestVCN -1 */
+        if (LastVcn == (ULONGLONG)-1)
         {
             Status = STATUS_INVALID_PARAMETER;
             DPRINT1("DRIVER ERROR: FreeClusters called to free %lu clusters, which is %lu more clusters than are assigned to attribute!",
@@ -1136,31 +1143,43 @@ FreeClusters(PNTFS_VCB Vcb,
             break;
         }
 
-        if (LargeLbn != -1)
+        /* The last VCN of a sparse stream can sit in a hole, which owns no cluster */
+        if (FsRtlLookupLargeMcbEntry(&AttrContext->DataRunsMCB, LastVcn, &LargeLbn, NULL, NULL, NULL, NULL) &&
+            LargeLbn != -1)
         {
             // deallocate this cluster
-            RtlClearBits(&Bitmap, LargeLbn, 1);
+            RtlClearBits(&Vcb->ClusterBitmap, (ULONG)LargeLbn, 1);
+            LowestFreed = min(LowestFreed, (ULONG)LargeLbn);
+            HighestFreed = max(HighestFreed, (ULONG)LargeLbn);
+            Freed++;
         }
-        FsRtlTruncateLargeMcb(&AttrContext->DataRunsMCB, AttrContext->pRecord->NonResident.HighestVCN);
+        FsRtlTruncateLargeMcb(&AttrContext->DataRunsMCB, LastVcn);
 
-        // decrement HighestVCN, but don't let it go below 0
-        AttrContext->pRecord->NonResident.HighestVCN = min(AttrContext->pRecord->NonResident.HighestVCN, AttrContext->pRecord->NonResident.HighestVCN - 1);
+        /* Freeing the last cluster leaves the -1 of an empty stream */
+        AttrContext->pRecord->NonResident.HighestVCN = LastVcn - 1;
         ClustersLeftToFree--;
     }
 
-    // update $BITMAP file on disk
-    Status = WriteAttribute(Vcb, DataContext, 0, BitmapData, (ULONG)BitmapDataSize, &LengthWritten, FileRecord);
-    if (!NT_SUCCESS(Status))
+    if (AttrContext->pRecord->Flags & (NTFS_ATTR_COMPRESSION_MASK | NTFS_ATTR_SPARSE))
+        AttrContext->pRecord->NonResident.CompressedSize -= (ULONGLONG)Freed * Vcb->NtfsInfo.BytesPerCluster;
+
+    if (Freed != 0)
     {
-        ReleaseAttributeContext(DataContext);
-        ExFreePoolWithTag(BitmapData, TAG_NTFS);
-        ExFreeToNPagedLookasideList(&Vcb->FileRecLookasideList, BitmapRecord);
-        return Status;
+        NTSTATUS WriteStatus;
+
+        Vcb->FreeClusterCount += Freed;
+
+        // update $BITMAP file on disk
+        WriteStatus = NtfsWriteVolumeBitmap(Vcb, LowestFreed, HighestFreed - LowestFreed + 1);
+        if (NT_SUCCESS(Status))
+            Status = WriteStatus;
     }
 
-    ReleaseAttributeContext(DataContext);
-    ExFreePoolWithTag(BitmapData, TAG_NTFS);
-    ExFreeToNPagedLookasideList(&Vcb->FileRecLookasideList, BitmapRecord);
+    ExReleaseResourceLite(&Vcb->BitmapResource);
+    KeLeaveCriticalRegion();
+
+    if (!NT_SUCCESS(Status))
+        return Status;
 
     // Save updated data runs to file record
 
@@ -1172,11 +1191,20 @@ FreeClusters(PNTFS_VCB Vcb,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Convert the map control block back to encoded data runs
-    ConvertLargeMCBToDataRuns(&AttrContext->DataRunsMCB, RunBuffer, Vcb->NtfsInfo.BytesPerCluster, &RunBufferSize);
+    // Convert the map control block back to encoded data runs.
+    // RunBuffer is one file record long (not one cluster) - see AddRun().
+    ConvertLargeMCBToDataRuns(&AttrContext->DataRunsMCB,
+                              AttrContext->pRecord->NonResident.HighestVCN + 1,
+                              RunBuffer,
+                              Vcb->NtfsInfo.BytesPerFileRecord,
+                              &RunBufferSize);
 
     // Update HighestVCN
     DestinationAttribute->NonResident.HighestVCN = AttrContext->pRecord->NonResident.HighestVCN;
+
+    /* Only these headers have the field; in others its offset is the name or the runs */
+    if (AttrContext->pRecord->Flags & (NTFS_ATTR_COMPRESSION_MASK | NTFS_ATTR_SPARSE))
+        DestinationAttribute->NonResident.CompressedSize = AttrContext->pRecord->NonResident.CompressedSize;
 
     // Write data runs to destination attribute
     RtlCopyMemory((PVOID)((ULONG_PTR)DestinationAttribute + DestinationAttribute->NonResident.MappingPairsOffset),
@@ -1204,7 +1232,9 @@ FreeClusters(PNTFS_VCB Vcb,
 
     ExFreePoolWithTag(RunBuffer, TAG_NTFS);
 
+#if NTFS_DUMP_DATA_RUNS
     NtfsDumpDataRuns((PUCHAR)((ULONG_PTR)DestinationAttribute + DestinationAttribute->NonResident.MappingPairsOffset), 0);
+#endif
 
     return Status;
 }
@@ -1761,7 +1791,7 @@ NtfsDumpDataRuns(PVOID StartOfRun,
 
     if (CurrentLCN == 0)
     {
-        DPRINT1("Dumping data runs.\n\tData:\n\t\t");
+        DPRINT("Dumping data runs.\n\tData:\n\t\t");
         NtfsDumpDataRunData(StartOfRun);
         DbgPrint("\n\tRuns:\n\t\tOff\t\tLCN\t\tLength\n");
     }

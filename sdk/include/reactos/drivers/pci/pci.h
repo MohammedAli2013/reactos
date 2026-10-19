@@ -84,6 +84,9 @@ typedef struct _SLOT_INFO
     UCHAR Reserved;
 } SLOT_INFO, *PSLOT_INFO;
 
+#define PCI_IRQ_ROUTING_TABLE_SIGNATURE 'RIP$'
+#define PCI_IRQ_ROUTING_TABLE_VERSION   0x0100
+
 typedef struct _PCI_IRQ_ROUTING_TABLE
 {
     ULONG Signature;
@@ -107,9 +110,23 @@ typedef struct _PCI_REGISTRY_INFO
 {
     UCHAR MajorRevision;
     UCHAR MinorRevision;
-    UCHAR NoBuses; // Number Of Buses
+    UCHAR NoBuses; // Number of buses. Note: Wraps when the highest bus number is 255
     UCHAR HardwareMechanism;
 } PCI_REGISTRY_INFO, *PPCI_REGISTRY_INFO;
+
+/**
+ * @brief
+ * Retrieves the corrected number of buses from the PCI_REGISTRY_INFO structure.
+ *
+ * PCI_REGISTRY_INFO::NoBuses is a UCHAR (0-255). Thus, this member would wrap
+ * to 0 for a system having exactly the maximum number of allowed PCI buses (256).
+ * In order to distinguish this case from the one where no PCI system (and no bus)
+ * is present, verify the Major/MinorRevision values. If they are initialized
+ * (and NoBuses == 0), this means that the system actually has 256 buses.
+ **/
+#define PCI_GET_NUM_OF_BUSES(PciRegInfo) \
+    ((USHORT)((PciRegInfo)->NoBuses ? (PciRegInfo)->NoBuses : \
+       ((PciRegInfo)->MajorRevision | (PciRegInfo)->MinorRevision) ? (PCI_MAX_BRIDGE_NUMBER + 1) : 0))
 
 //
 // PCI Card Descriptor in Registry

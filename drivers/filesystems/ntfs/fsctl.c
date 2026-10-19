@@ -90,7 +90,7 @@ NtfsHasFileSystem(PDEVICE_OBJECT DeviceToMount)
         }
     }
 
-    DPRINT1("BytesPerSector: %lu\n", DiskGeometry.BytesPerSector);
+    DPRINT("BytesPerSector: %lu\n", DiskGeometry.BytesPerSector);
     BootSector = ExAllocatePoolWithTag(NonPagedPool,
                                        DiskGeometry.BytesPerSector,
                                        TAG_NTFS);
@@ -298,6 +298,9 @@ NtfsGetVolumeData(PDEVICE_OBJECT DeviceObject,
         return Status;
     }
 
+    /* A non-resident attribute list in $MFT is read through this */
+    DeviceExt->StorageDevice = DeviceObject;
+
     Status = FindAttribute(DeviceExt,
                            DeviceExt->MasterFileTable,
                            AttributeData,
@@ -323,7 +326,6 @@ NtfsGetVolumeData(PDEVICE_OBJECT DeviceObject,
     }
 
     /* Read Volume File (MFT index 3) */
-    DeviceExt->StorageDevice = DeviceObject;
     Status = ReadFileRecord(DeviceExt,
                             NTFS_FILE_VOLUME,
                             VolumeRecord);
@@ -406,6 +408,15 @@ NtfsGetVolumeData(PDEVICE_OBJECT DeviceObject,
     ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, VolumeRecord);
 
     NtfsInfo->MftZoneReservation = NtfsQueryMftZoneReservation();
+
+    /* NTFS defines its own case folding through $UpCase; without it every
+     * case-insensitive comparison on this volume would use the wrong table. */
+    Status = NtfsLoadUpCaseTable(DeviceExt);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("Failed to load $UpCase (Status %lx)\n", Status);
+        return Status;
+    }
 
     return Status;
 }
@@ -534,7 +545,13 @@ NtfsMountVolume(PDEVICE_OBJECT DeviceObject,
     }
     _SEH2_END;
 
+    Status = NtfsLoadVolumeBitmap(Vcb);
+    if (!NT_SUCCESS(Status))
+        goto ByeBye;
+
     ExInitializeResourceLite(&Vcb->DirResource);
+    ExInitializeResourceLite(&Vcb->IndexResource);
+    ExInitializeResourceLite(&Vcb->BitmapResource);
 
     KeInitializeSpinLock(&Vcb->FcbListLock);
 
@@ -563,6 +580,15 @@ ByeBye:
 
         if (Ccb)
             ExFreePool(Ccb);
+
+        if (Vcb != NULL)
+            NtfsFreeVolumeBitmap(Vcb);
+
+        if (Vcb != NULL && Vcb->UpCaseTable != NULL)
+        {
+            ExFreePoolWithTag(Vcb->UpCaseTable, TAG_NTFS);
+            Vcb->UpCaseTable = NULL;
+        }
 
         if (Lookaside)
             ExDeleteNPagedLookasideList(&Vcb->FileRecLookasideList);
@@ -731,8 +757,6 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
     PIO_STACK_LOCATION Stack;
     PVOLUME_BITMAP_BUFFER BitmapBuffer;
     LONGLONG StartingLcn;
-    PFILE_RECORD_HEADER BitmapRecord;
-    PNTFS_ATTR_CONTEXT DataContext;
     ULONGLONG TotalClusters;
     ULONGLONG ToCopy;
     BOOLEAN Overflow = FALSE;
@@ -803,35 +827,17 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
         ToCopy = Stack->Parameters.FileSystemControl.OutputBufferLength - FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer);
     }
 
-    BitmapRecord = ExAllocateFromNPagedLookasideList(&DeviceExt->FileRecLookasideList);
-    if (BitmapRecord == NULL)
-    {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    Status = ReadFileRecord(DeviceExt, NTFS_FILE_BITMAP, BitmapRecord);
-    if (!NT_SUCCESS(Status))
-    {
-        DPRINT1("Failed reading volume bitmap: %lx\n", Status);
-        ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, BitmapRecord);
-        return Status;
-    }
-
-    Status = FindAttribute(DeviceExt, BitmapRecord, AttributeData, L"", 0, &DataContext, NULL);
-    if (!NT_SUCCESS(Status))
-    {
-        DPRINT1("Failed find $DATA for bitmap: %lx\n", Status);
-        ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, BitmapRecord);
-        return Status;
-    }
-
     BitmapBuffer->StartingLcn.QuadPart = StartingLcn;
     BitmapBuffer->BitmapSize.QuadPart = ToCopy * 8;
 
     Irp->IoStatus.Information = FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer);
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceSharedLite(&DeviceExt->BitmapResource, TRUE);
     _SEH2_TRY
     {
-        Irp->IoStatus.Information += ReadAttribute(DeviceExt, DataContext, StartingLcn / 8, (PCHAR)BitmapBuffer->Buffer, ToCopy);
+        RtlCopyMemory(BitmapBuffer->Buffer, (PUCHAR)DeviceExt->BitmapBuffer + StartingLcn / 8, (SIZE_T)ToCopy);
+        Irp->IoStatus.Information += (ULONG_PTR)ToCopy;
         Status = (Overflow ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS);
     }
     _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
@@ -839,8 +845,8 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
         Status = _SEH2_GetExceptionCode();
     }
     _SEH2_END;
-    ReleaseAttributeContext(DataContext);
-    ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, BitmapRecord);
+    ExReleaseResourceLite(&DeviceExt->BitmapResource);
+    KeLeaveCriticalRegion();
 
     return Status;
 }
@@ -895,6 +901,78 @@ LockOrUnlockVolume(PDEVICE_EXTENSION DeviceExt,
 }
 
 
+/**
+* @name NtfsDismountVolume
+* @implemented
+*
+* Takes the volume offline so the caller can reformat or eject the media.
+*
+* @param DeviceExt
+* Volume control block of the volume to dismount
+*
+* @param Irp
+* The FSCTL_DISMOUNT_VOLUME request
+*
+* @return
+* STATUS_SUCCESS once the volume is offline, STATUS_INVALID_PARAMETER if the
+* request did not come through a handle on the volume itself, or
+* STATUS_VOLUME_DISMOUNTED if it already was.
+*
+* @remarks The VCB is not torn down here: the caller keeps its handle open and
+* goes on writing over the volume through it, so the device object has to stay
+* alive. What changes is that the volume is no longer mounted,
+* VPB_DIRECT_WRITES_ALLOWED lets raw writes through, and anything needing
+* on-disk metadata is refused.
+*
+*/
+static
+NTSTATUS
+NtfsDismountVolume(PDEVICE_EXTENSION DeviceExt,
+                   PIRP Irp)
+{
+    PIO_STACK_LOCATION Stack;
+    PFILE_OBJECT FileObject;
+    PNTFS_FCB Fcb;
+    KIRQL SavedIrql;
+
+    Stack = IoGetCurrentIrpStackLocation(Irp);
+    FileObject = Stack->FileObject;
+    Fcb = FileObject->FsContext;
+
+    /* Only a handle on the volume itself may dismount it */
+    if (!(Fcb->Flags & FCB_IS_VOLUME))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (DeviceExt->Flags & VCB_VOLUME_DISMOUNTED)
+    {
+        return STATUS_VOLUME_DISMOUNTED;
+    }
+
+    DPRINT1("Dismounting volume\n");
+
+    FsRtlNotifyVolumeEvent(FileObject, FSRTL_VOLUME_DISMOUNT);
+
+    ExAcquireResourceExclusiveLite(&DeviceExt->DirResource, TRUE);
+
+    DeviceExt->Flags |= VCB_VOLUME_DISMOUNTED;
+
+    /* Drop the mounted state and allow raw writes, so the I/O manager stops
+     * handing us opens of a partition that's being overwritten */
+    IoAcquireVpbSpinLock(&SavedIrql);
+    if (DeviceExt->StorageDevice->Vpb != NULL)
+    {
+        DeviceExt->StorageDevice->Vpb->Flags |= VPB_DIRECT_WRITES_ALLOWED;
+        DeviceExt->StorageDevice->Vpb->Flags &= ~VPB_MOUNTED;
+    }
+    IoReleaseVpbSpinLock(SavedIrql);
+
+    ExReleaseResourceLite(&DeviceExt->DirResource);
+
+    return STATUS_SUCCESS;
+}
+
 static
 NTSTATUS
 NtfsUserFsRequest(PDEVICE_OBJECT DeviceObject,
@@ -935,6 +1013,10 @@ NtfsUserFsRequest(PDEVICE_OBJECT DeviceObject,
 
         case FSCTL_UNLOCK_VOLUME:
             Status = LockOrUnlockVolume(DeviceExt, Irp, FALSE);
+            break;
+
+        case FSCTL_DISMOUNT_VOLUME:
+            Status = NtfsDismountVolume(DeviceExt, Irp);
             break;
 
         case FSCTL_GET_NTFS_VOLUME_DATA:

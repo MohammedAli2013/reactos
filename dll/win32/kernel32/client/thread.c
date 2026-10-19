@@ -18,6 +18,8 @@
 
 typedef NTSTATUS (NTAPI *PCSR_CREATE_REMOTE_THREAD)(IN HANDLE ThreadHandle, IN PCLIENT_ID ClientId);
 
+#define THREAD_ALL_ACCESS_NT6 (STANDARD_RIGHTS_REQUIRED|SYNCHRONIZE|0xFFFF)
+
 /* FUNCTIONS ******************************************************************/
 
 NTSTATUS
@@ -217,7 +219,7 @@ CreateRemoteThread(IN HANDLE hProcess,
 
     /* Create the Kernel Thread Object */
     Status = NtCreateThread(&hThread,
-                            THREAD_ALL_ACCESS,
+                            THREAD_ALL_ACCESS_NT6,
                             ObjectAttributes,
                             hProcess,
                             &ClientId,
@@ -385,9 +387,10 @@ ExitThread(IN DWORD uExitCode)
 
     /* Notify DLLs and TLS Callbacks of termination */
     LdrShutdownThread();
-
+#if (NTDDI_VERSION < NTDDI_LONGHORN)
     /* Tell the Kernel to free the Stack */
     NtCurrentTeb()->FreeStackOnTermination = TRUE;
+#endif
     NtTerminateThread(NULL, uExitCode);
 
     /* We should never reach this place */
